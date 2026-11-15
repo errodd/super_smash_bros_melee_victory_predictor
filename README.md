@@ -110,7 +110,7 @@ python src/extract_data.py \
 ## Phase 1 — Exploratory Data Analysis Summary (`notebooks/01_eda.ipynb`)
 
 1.  **Formal Prediction Timestamp:** Defined as $t = \text{frame}$. Permissible features comprise any observation observable at or before $t$ ($\mathcal{F}_t$). The target $Y \in \{1, 2\}$ is the final match winner. Snapshot state variables are not data leakage.
-2.  **Match Independence and Leakage Prevention:** Row shuffling does not equal statistical independence. 49 complete match segments were reconstructed (median duration: 10,627 frames / ~2.95 min). `0000_m16` and `0000_m25` are two fragments of the same real match (Zelda's mid-match transformation splits `p1_character`), so they must stay on the same side of any split/fold.
+2.  **Match Independence and Leakage Prevention:** Row shuffling does not equal statistical independence. 48 canonical matches were reconstructed (median duration: 10,629 frames / ~2.95 min), unifying mid-match Sheik/Zelda transformations (`0000_m16` and `0000_m25`) directly in `src/extract_data.py` before any split or fold assignment.
 3.  **Cross-Partition Representativeness Audit:** File-to-file variance (e.g. P1 win rate ranging from 45.53% in `0040` to 67.38% in `0000`) is caused by each archive containing ~20-25 complete matches.
 4.  **Data Quality & Observation Duplicates:** `row_id` is 100% unique. 338 duplicate observations (0.0625%) were detected, restricted entirely to the frozen countdown phase (`frame < 0`, 5,904 frames / 1.09%).
 5.  **Target Balance & Heuristic Baseline:** P1 wins = 55.4459%, P2 wins = 44.5541%. Naive domain baseline (more stocks wins; ties broken by lower damage percent) achieves **74.8024% accuracy**, Macro F1 = 74.27%. This sets the performance floor for ML models.
@@ -121,65 +121,49 @@ python src/extract_data.py \
 
 ## Phase 2 — Data Preparation & Feature Engineering (`notebooks/02_data_preparation.ipynb`)
 
-### 1. Pre-Split Cleansing
-*   5,904 countdown frames (`frame < 0`) removed.
-*   48 terminal frames (`p1_stock == 0` or `p2_stock == 0`) removed.
-*   Retained dataset: **534,988 clean observations**.
+### 1. Pre-Split Cleansing & Canonicalization
+*   Operates on the expanded development dataset `data/processed_dev.parquet` (partitions `0000`–`0005`, 1,577,114 raw frames, 144 canonical matches).
+*   Countdown frames (`frame < 0`) and terminal frames (`p1_stock == 0` or `p2_stock == 0`) are removed deterministically, retaining **1,559,260 clean observations**.
 
 ### 2. Anti-Leakage Partitioning (`GroupShuffleSplit`)
-*   `GroupShuffleSplit(n_splits=1, test_size=0.20, random_state=42)` grouped strictly on `match_id`.
-*   Train: 39 matches (426,378 frames). Test: 10 matches (108,610 frames).
-*   Zero match overlap verified between train and test.
+*   `GroupShuffleSplit(n_splits=1, test_size=0.20, random_state=42)` grouped strictly on canonical `match_id`.
+*   Train: 115 matches. Test: 29 matches. Zero match overlap verified.
 
-### 3. Custom Feature Engineering (`MeleeFeatureEngineer`)
-Native Scikit-Learn transformer deriving domain features: `stock_diff`, `percent_diff`, `stock_ratio`, `spatial_distance`, `p1_edgeguard_advantage`.
+### 3. Custom Feature Engineering (`src/features/transformers.py`)
+Native Scikit-Learn transformer (`MeleeFeatureEngineer`) and pipeline factory (`build_model_pipeline`) imported directly from `src/features/transformers.py` (DRY):
+*   Base 5 features + symmetric edgeguard (`p2_edgeguard_advantage`, trivalued `edgeguard_advantage`) + configurable lexicographic domain features (`stocks_tied`, `stocks_tied_x_percent_diff`, `heuristic_pred`, `advantage_sign`, `advantage_magnitude`).
 
-### 4. Column Grouping & Preprocessing Pipeline
-Numerical (median imputation + scaling), categorical (`stage`, `p1_character`, `p2_character`; one-hot), binary (cast to float32). `p1_costume`, `p2_costume`, `p1_action`, `p2_action` excluded.
-
-### 5. Pipeline Assembly and Output Matrices
-```python
-full_pipeline = Pipeline(steps=[
-    ("features", MeleeFeatureEngineer()),
-    ("preprocess", preprocessor),
-])
-```
-Fitted exclusively on `X_train`. Produces dense float32 matrices with 74 output features, 0 NaN/inf.
+### 4. Column Grouping, Preprocessing & Handoff Artifacts
+Numerical (median imputation + scaling), categorical (`stage`, `p1_character`, `p2_character`; one-hot), binary (`SimpleImputer(strategy="most_frequent")` + `float64` cast). Produces uniform **`float64`** dense matrices with 0 NaN/inf. Exposes raw `X_train`, `y_train`, `groups_train`, and unfitted `build_model_pipeline(estimator)` for CV (never `X_train_proc`), and exports `artifacts/split_manifest.parquet`, `artifacts/groups_train.npy`, and `artifacts/prep_metadata.json`.
 
 ---
 
 ## Phase 3 — Model Selection & Hyperparameter Optimization (`notebooks/03_modeling_and_model_selection.ipynb`)
 
-*   **Protocol:** `GroupKFold(n_splits=5)` on `match_id` (38 canonical groups after unifying `0000_m25` into `0000_m16`), reused across all models.
-*   **Diagnosed issue:** the full 74-feature pipeline overfit to match identity (stage/character one-hot acted as a match fingerprint with only 38 groups); model selection uses 5 domain-derived features instead (`stock_diff`, `percent_diff`, `stock_ratio`, `spatial_distance`, `p1_edgeguard_advantage`).
-*   **Candidates:** `DummyClassifier`, `LogisticRegression`, `RandomForestClassifier`, `HistGradientBoostingClassifier`, compared via grouped CV (accuracy, F1 macro, ROC AUC).
-*   **Tuning:** Optuna (`TPESampler(seed=42)`) tunes `LogisticRegression` with grouped CV inside each trial.
-*   **Final test evaluation** (touched once): accuracy = 0.739260, F1 macro = 0.739233, ROC AUC = 0.804667. The ML pipeline did not surpass the domain heuristic baseline (75.03%); the value of this phase is the leakage-free selection methodology, not beating a deterministic rule.
+*   **Protocol:** `StratifiedGroupKFold(n_splits=5)` vs `GroupKFold(n_splits=5)` on canonical `match_id` (115 training matches).
+*   **Fair Domain Heuristic & Ablation:** Lexicographic heuristic evaluated on the exact same 5 CV folds, Test, and blind Holdout; 6-configuration ablation study (`base5` through `full + actions` with `min_frequency` and strong regularization) plus lexicographic feature engineering evaluation.
+*   **Tuning & OOF Threshold:** Optuna (`TPESampler(seed=42)`) tunes `HistGradientBoostingClassifier` (20 trials) and `LogisticRegression` (15 trials); grouped out-of-fold (OOF) probabilities select the optimal accuracy threshold (`0.505`) before touching Test or Holdout.
+*   **Final Single Evaluation & Serialization:** Evaluated once on Test (29 matches) and once on a completely untouched blind Holdout (`data/processed_holdout.parquet`, partitions `00fd`+`00fe`, 48 matches / 516,995 clean frames: **73.17% accuracy, 0.8167 ROC AUC** vs 73.33% domain heuristic). Final pipeline and metadata serialized to `models/final_model.joblib` and `models/model_metadata.json`.
 
 ---
 
 ## Reproduction Guide
 
-> **Working directory note:** notebooks resolve the dataset path differently and must be launched accordingly:
-> * `notebooks/01_eda.ipynb` uses the root-relative path `data/processed_sample.parquet` → run **from the repository root**.
-> * `notebooks/02_data_preparation.ipynb` and `notebooks/03_modeling_and_model_selection.ipynb` use `Path("../data/processed_sample.parquet")` → run **from inside `notebooks/`**.
-
 ```bash
 # 1. Activate the environment
 source .venv/bin/activate
 
-# 2. Extract the sample data from raw archives
-python src/extract_data.py \
-  --input_files data/archive/train/0000.msgpack.zst data/archive/train/0001.msgpack.zst \
-  --output_path data/processed_sample.parquet
+# 2. Run unit tests
+python -m pytest -v tests/
 
-# 3. Execute Phase 1 (EDA) — from repository root
-jupyter nbconvert --to notebook --execute notebooks/01_eda.ipynb --output notebooks/01_eda.ipynb
+# 3. Extract canonicalized sample, dev, and blind holdout datasets
+python src/extract_data.py --partitions 0000 0001 --output_path data/processed_sample.parquet
+python src/extract_data.py --partitions 0000 0001 0002 0003 0004 0005 --output_path data/processed_dev.parquet
+python src/extract_data.py --partitions 00fd 00fe --output_path data/processed_holdout.parquet
 
-# 4. Execute Phase 2 and Phase 3 — from notebooks/
-cd notebooks
-jupyter nbconvert --to notebook --execute 02_data_preparation.ipynb --output 02_data_preparation.ipynb
-jupyter nbconvert --to notebook --execute 03_modeling_and_model_selection.ipynb --output 03_modeling_and_model_selection.ipynb
-cd ..
+# 4. Execute all three notebooks sequentially (Restart Kernel -> Run All)
+jupyter nbconvert --to notebook --execute --inplace notebooks/01_eda.ipynb
+jupyter nbconvert --to notebook --execute --inplace notebooks/02_data_preparation.ipynb
+jupyter nbconvert --to notebook --execute --inplace notebooks/03_modeling_and_model_selection.ipynb
 ```
 All three notebooks execute to completion with return code 0, validating all assertions and embedding visual outputs directly into the `.ipynb` files.
