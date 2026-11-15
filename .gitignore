@@ -1,1 +1,6 @@
 /data
+/.supermario
+/config.local
+
+# Bytecode cache de Python (cualquier nivel: raiz, src/, src/features/)
+__pycache__/

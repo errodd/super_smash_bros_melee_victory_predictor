@@ -1,12 +1,48 @@
 # Super Smash Bros Melee Victory Predictor
 
-This repository contains the data extraction pipeline and the Exploratory Data Analysis (EDA) for the Super Smash Bros Melee victory prediction project. The core objective is to analyze instantaneous game state snapshots taken at a given frame to predict whether Player 1 or Player 2 will ultimately win the match.
+**Universidad de Carabobo**
+**Facultad Experimental de Ciencias y Tecnología (FACYT)**
+**Departamento de Computación**
+**Course:** Machine Learning (Aprendizaje Automático)
+**Authors:** Adrián Ramírez, Sebastián Piñango
+**Professor:** Álvaro Espinoza
+
+This repository contains the end-to-end data processing, exploratory data analysis, feature engineering, and model selection pipelines for predicting the winner of Super Smash Bros. Melee matches based on instantaneous snapshot frames.
+
+---
+
+## Repository Structure
+
+```text
+.
+├── README.md                              # Project documentation and reproduction guide
+├── requirements.txt                       # Python dependencies
+├── data/
+│   ├── archive/                           # Raw msgpack archives and labels (tracked via DVC)
+│   │   ├── train/                         # Training archives (0000.msgpack.zst - 00ff.msgpack.zst)
+│   │   ├── test/                          # Test archives
+│   │   └── training_labels.csv            # Match outcome labels
+│   └── processed_sample.parquet           # Flattened 540k sample dataset with reconstructed match_id
+├── notebooks/
+│   ├── 01_eda.ipynb                       # Phase 1: Exploratory Data Analysis
+│   ├── 02_data_preparation.ipynb          # Phase 2: Data Preparation & Feature Engineering
+│   └── 03_modeling_and_model_selection.ipynb  # Phase 3: Model Selection & Hyperparameter Optimization
+├── reports/
+│   └── figures/
+└── src/
+    ├── extract_data.py                    # Streaming decompression, match reconstruction, and flattening script
+    ├── audit_processed_sample.py          # Processed dataset auditing
+    ├── generate_sample.py                 # Sample generation utility
+    ├── inspect_dataset.py                 # Raw dataset inspection
+    └── features/
+        └── transformers.py                # MeleeFeatureEngineer (domain feature engineering)
+```
 
 ---
 
 ## Environment Setup and Configuration
 
-The project uses a Python virtual environment to manage dependencies. Follow these instructions to set up and run the code.
+The project runs on Python 3.10+ using a dedicated virtual environment.
 
 ### 1. Initialize the Virtual Environment
 Activate the pre-configured virtual environment in your terminal:
@@ -15,53 +51,54 @@ source .venv/bin/activate
 ```
 
 ### 2. Dependencies
-The required packages are defined in `requirements.txt`. They can be installed using uv or pip:
+Install the required packages using `uv` or `pip`:
 ```bash
 uv pip install -r requirements.txt
 ```
 Key dependencies:
-*   zstandard & msgpack: Stream decompression and binary unpacking.
-*   pandas & numpy: Data manipulation and numerical operations.
-*   pyarrow: Columnar Parquet reading and writing.
-*   matplotlib & seaborn: Statistical visual plotting.
-*   scikit-learn: Classification metrics and grouped splitting validation.
-*   ipykernel & nbconvert: Programmatic Jupyter notebook execution.
+*   `zstandard` & `msgpack`: Streaming decompression and binary deserialization.
+*   `pandas` & `numpy`: High-performance tabular data structures and numerical operations.
+*   `pyarrow`: Parquet I/O and columnar storage.
+*   `matplotlib` & `seaborn`: Statistical visualizations.
+*   `scikit-learn`: Transformers, `ColumnTransformer`, pipelines, `GroupShuffleSplit`, `GroupKFold`.
+*   `optuna`: Hyperparameter optimization.
+*   `ipykernel` & `nbconvert`: Programmatic Jupyter notebook execution.
 
 ### 3. Jupyter Kernel Registration
-A custom kernel has been registered to ensure notebooks execute within this environment:
+Register the virtual environment as an interactive kernel:
 ```bash
 .venv/bin/python -m ipykernel install --user --name=ssbm-victory-predictor --display-name="Python (SSBM Predictor)"
 ```
-When opening the notebook in VS Code or Jupyter Lab, select the "Python (SSBM Predictor)" kernel.
+When opening a notebook in VS Code or Jupyter Lab, select the **Python (SSBM Predictor)** kernel.
 
 ---
 
 ## Dataset Management via DVC
 
-The dataset is versioned using DVC (Data Version Control) to avoid committing massive binary files to Git.
+The raw dataset comprises over 65 million frames (~880 MB compressed, ~15 GB uncompressed). Data files are managed and versioned using DVC (Data Version Control) backed by Google Drive.
 
-### Synchronizing the Data
+### Pulling the Data
 ```bash
 dvc pull
 ```
-This command pulls the compressed archive files (`data/archive/train/*.msgpack.zst`) and the labels CSV (`data/archive/training_labels.csv`).
+This retrieves `data/archive/train/*.msgpack.zst` and `data/archive/training_labels.csv`.
 
-**Security Notice Regarding Credentials:**  
-Do not commit or push private authentication tokens or OAuth credentials to Git. If configuring remote access, always use the local configuration flag (`dvc remote modify <name> --local credentialpath <path>`), which writes exclusively to `.dvc/config.local` (ignored by Git).
+**Security Notice Regarding Credentials:**
+Never commit or push OAuth client secrets, API tokens, or `.dvc/config.local` to Git. Private credentials must remain exclusively in `.dvc/config.local`, which is listed in `.dvc/.gitignore`.
 
 ---
 
-## Data Extraction Pipeline
+## Data Extraction Pipeline (`src/extract_data.py`)
 
-The raw dataset contains over 65 million frames stored across 256 compressed archives (`0000.msgpack.zst` to `00ff.msgpack.zst`). 
+The extraction script bridges raw nested binary game states into structured tabular Parquet records.
 
-The extraction script `src/extract_data.py`:
-1.  **Decompresses in streaming mode** using `zstandard` and `msgpack` with `strict_map_key=False`.
-2.  **Reconstructs full matches (`match_id`)** by clustering contiguous frame sequences for each unique stage, costume, and character combination.
-3.  **Preserves true missingness** by avoiding silent `.get()` fallback defaults, ensuring that absent values are represented as `None`/`NaN`.
-4.  **Optimizes label mapping** by reading `training_labels.csv` with early-exit logic, loading hundreds of thousands of outcomes in under two seconds.
+Key capabilities:
+1.  **Streaming Decompression:** Reads `.msgpack.zst` archives chunk-by-chunk using `zstandard` and `msgpack` with `strict_map_key=False`.
+2.  **Match Reconstruction (`match_id`):** Frames inside the raw archives were shuffled. The script reconstructs complete continuous matches by grouping frames sharing identical stage, player costumes, and character choices, and sorting by frame index. Any continuous sequence ($f, f+1, f+2, \dots$) is assigned a unique `match_id` (e.g. `0000_m01`).
+3.  **Unmasked Schema:** Avoids silent fallback defaults (`.get("stock", 0)`), ensuring that absent fields evaluate to `None`/`NaN` for true schema validation.
+4.  **Early-Exit Label Matching:** Streams `training_labels.csv` lexicographically, loading label subsets in under two seconds.
 
-To extract a sample of frames (partitions `0000` and `0001`, containing 540,940 frames and 49 reconstructed matches) and save to Parquet:
+To extract a 540,940-frame sample from partitions `0000` and `0001` (49 reconstructed matches) and save to Parquet:
 ```bash
 python src/extract_data.py \
   --input_files data/archive/train/0000.msgpack.zst data/archive/train/0001.msgpack.zst \
@@ -70,54 +107,63 @@ python src/extract_data.py \
 
 ---
 
-## Exploratory Data Analysis (EDA) Summary
+## Phase 1 — Exploratory Data Analysis Summary (`notebooks/01_eda.ipynb`)
 
-The analysis is documented in `EDA.ipynb`. All metrics and findings below were computed empirically from the actual data.
-
-### 1. Match Structure and Statistical Independence
-Physical shuffling of rows does not create statistical independence. Frames originating from the same match share the same two players, character mechanics, and common final outcome, with heavy temporal autocorrelation. By grouping contiguous sequences, we identified 49 complete matches across partitions `0000` and `0001` (ranging from 3,455 frames to 28,097 frames, with a median of 10,627 frames or ~2.95 minutes). Future machine learning models must use grouped splitting (`GroupShuffleSplit` on `match_id`) to prevent severe match-level data leakage.
-
-### 2. Sample Representativeness
-Auditing distributed partitions across the 256 archives (`0000`, `0040`, `0080`, `00c0`) demonstrates that individual files exhibit cluster-level variance in stage frequency and target balance (e.g., P1 win rate is 67.38% in `0000` but 45.53% in `0040`). This occurs because each archive holds roughly 20 to 25 complete matches. Production modeling pipelines should draw matches systematically across archives to ensure balanced representation.
-
-### 3. Data Quality and Duplicate States
-*   **Key Integrity:** `row_id` is 100% unique across all 540,940 rows.
-*   **Physical Observation Duplicates:** We detected 338 duplicate states (0.0625%) across the 12 physical game state features. These occur during the static pre-game countdown phase where characters stand frozen before input is unlocked.
-*   **Countdown Cleansing:** 5,904 frames (1.0914%) have negative frame indices (`frame < 0`). These should be filtered out during preprocessing because they contain no combat signal.
-
-### 4. Target Distribution and Naive Baseline
-*   **Class Balance:** Player 1 wins in 299,929 frames (55.4459%), and Player 2 wins in 241,011 frames (44.5541%).
-*   **Domain Heuristic:** Predicting the player with more remaining stocks (or less damage percent in ties) achieves an accuracy of **74.8024%** (404,636 correct predictions), with a Player 1 F1-score of 77.96% and a Player 2 F1-score of 70.59%. This 74.80% accuracy represents the strict performance floor for subsequent machine learning models.
-
-### 5. Predictability Across Match Progression
-Evaluating baseline accuracy conditionally across match phases answers when the winner becomes predictable:
-*   *Countdown (`frame < 0`):* 54.17% accuracy (equivalent to a random guess matching the majority class).
-*   *Early Game (`0 <= frame < 5000`, ~0-83s):* 71.25% accuracy.
-*   *Mid Game (`5000 <= frame < 12000`, ~1.4-3.3m):* 75.38% accuracy.
-*   *Late Game (`frame >= 12000`, >3.3m):* **92.21% accuracy**.
-Outcome uncertainty is high in early game, while late-game stock disparities make the winner overwhelmingly predictable.
-
-### 6. Tactical States and Feature Engineering
-*   **Relative Stock Difference (`stock_difference`):** Shows a moderate univariable linear correlation of -0.4588 with the outcome, outperforming raw individual stock counts. It is a promising candidate feature.
-*   **Relative Damage Difference (`percent_difference`):** Shows a weak linear correlation (+0.0643), acting primarily as an essential non-linear discriminator when players have equal stocks.
-*   **Tactical Penalties:** Being forced off-stage reduces Player 1's win rate from 56.49% to 50.32% (-6.17%). Being trapped in hitstun reduces Player 1's win rate from 57.23% to 49.22% (-8.01%).
+1.  **Formal Prediction Timestamp:** Defined as $t = \text{frame}$. Permissible features comprise any observation observable at or before $t$ ($\mathcal{F}_t$). The target $Y \in \{1, 2\}$ is the final match winner. Snapshot state variables are not data leakage.
+2.  **Match Independence and Leakage Prevention:** Row shuffling does not equal statistical independence. 48 canonical matches were reconstructed (median duration: 10,629 frames / ~2.95 min), unifying mid-match Sheik/Zelda transformations (`0000_m16` and `0000_m25`) directly in `src/extract_data.py` before any split or fold assignment.
+3.  **Cross-Partition Representativeness Audit:** File-to-file variance (e.g. P1 win rate ranging from 45.53% in `0040` to 67.38% in `0000`) is caused by each archive containing ~20-25 complete matches.
+4.  **Data Quality & Observation Duplicates:** `row_id` is 100% unique. 338 duplicate observations (0.0625%) were detected, restricted entirely to the frozen countdown phase (`frame < 0`, 5,904 frames / 1.09%).
+5.  **Target Balance & Heuristic Baseline:** P1 wins = 55.4459%, P2 wins = 44.5541%. Naive domain baseline (more stocks wins; ties broken by lower damage percent) achieves **74.8024% accuracy**, Macro F1 = 74.27%. This sets the performance floor for ML models.
+6.  **Predictability Across Match Progression:** 54.17% (countdown) → 71.25% (early) → 75.38% (mid) → **92.21%** (late game, >3.3 min).
+7.  **Tactical Variables:** `stock_difference` correlates -0.4588 with outcome (strongest univariable predictor). `percent_difference` correlates +0.0643 (weak linear, strong non-linear tie-breaker). Off-stage and hitstun states measurably reduce win probability.
 
 ---
 
-## Verification and Reproduction
+## Phase 2 — Data Preparation & Feature Engineering (`notebooks/02_data_preparation.ipynb`)
 
-To reproduce the analysis and verify that the notebook runs without error:
+### 1. Pre-Split Cleansing & Canonicalization
+*   Operates on the expanded development dataset `data/processed_dev.parquet` (partitions `0000`–`0005`, 1,577,114 raw frames, 144 canonical matches).
+*   Countdown frames (`frame < 0`) and terminal frames (`p1_stock == 0` or `p2_stock == 0`) are removed deterministically, retaining **1,559,260 clean observations**.
+
+### 2. Anti-Leakage Partitioning (`GroupShuffleSplit`)
+*   `GroupShuffleSplit(n_splits=1, test_size=0.20, random_state=42)` grouped strictly on canonical `match_id`.
+*   Train: 115 matches. Test: 29 matches. Zero match overlap verified.
+
+### 3. Custom Feature Engineering (`src/features/transformers.py`)
+Native Scikit-Learn transformer (`MeleeFeatureEngineer`) and pipeline factory (`build_model_pipeline`) imported directly from `src/features/transformers.py` (DRY):
+*   Base 5 features + symmetric edgeguard (`p2_edgeguard_advantage`, trivalued `edgeguard_advantage`) + configurable lexicographic domain features (`stocks_tied`, `stocks_tied_x_percent_diff`, `heuristic_pred`, `advantage_sign`, `advantage_magnitude`).
+
+### 4. Column Grouping, Preprocessing & Handoff Artifacts
+Numerical (median imputation + scaling), categorical (`stage`, `p1_character`, `p2_character`; one-hot), binary (`SimpleImputer(strategy="most_frequent")` + `float64` cast). Produces uniform **`float64`** dense matrices with 0 NaN/inf. Exposes raw `X_train`, `y_train`, `groups_train`, and unfitted `build_model_pipeline(estimator)` for CV (never `X_train_proc`), and exports `artifacts/split_manifest.parquet`, `artifacts/groups_train.npy`, and `artifacts/prep_metadata.json`.
+
+---
+
+## Phase 3 — Model Selection & Hyperparameter Optimization (`notebooks/03_modeling_and_model_selection.ipynb`)
+
+*   **Protocol:** `StratifiedGroupKFold(n_splits=5)` vs `GroupKFold(n_splits=5)` on canonical `match_id` (115 training matches).
+*   **Fair Domain Heuristic & Ablation:** Lexicographic heuristic evaluated on the exact same 5 CV folds, Test, and blind Holdout; 6-configuration ablation study (`base5` through `full + actions` with `min_frequency` and strong regularization) plus lexicographic feature engineering evaluation.
+*   **Tuning & OOF Threshold:** Optuna (`TPESampler(seed=42)`) tunes `HistGradientBoostingClassifier` (20 trials) and `LogisticRegression` (15 trials); grouped out-of-fold (OOF) probabilities select the optimal accuracy threshold (`0.505`) before touching Test or Holdout.
+*   **Final Single Evaluation & Serialization:** Evaluated once on Test (29 matches) and once on a completely untouched blind Holdout (`data/processed_holdout.parquet`, partitions `00fd`+`00fe`, 48 matches / 516,995 clean frames: **73.17% accuracy, 0.8167 ROC AUC** vs 73.33% domain heuristic). Final pipeline and metadata serialized to `models/final_model.joblib` and `models/model_metadata.json`.
+
+---
+
+## Reproduction Guide
 
 ```bash
-# 1. Activate environment
+# 1. Activate the environment
 source .venv/bin/activate
 
-# 2. Extract sample data
-python src/extract_data.py \
-  --input_files data/archive/train/0000.msgpack.zst data/archive/train/0001.msgpack.zst \
-  --output_path data/processed_sample.parquet
+# 2. Run unit tests
+python -m pytest -v tests/
 
-# 3. Execute notebook programmatically
-jupyter nbconvert --to notebook --execute EDA.ipynb --output EDA.ipynb
+# 3. Extract canonicalized sample, dev, and blind holdout datasets
+python src/extract_data.py --partitions 0000 0001 --output_path data/processed_sample.parquet
+python src/extract_data.py --partitions 0000 0001 0002 0003 0004 0005 --output_path data/processed_dev.parquet
+python src/extract_data.py --partitions 00fd 00fe --output_path data/processed_holdout.parquet
+
+# 4. Execute all three notebooks sequentially (Restart Kernel -> Run All)
+jupyter nbconvert --to notebook --execute --inplace notebooks/01_eda.ipynb
+jupyter nbconvert --to notebook --execute --inplace notebooks/02_data_preparation.ipynb
+jupyter nbconvert --to notebook --execute --inplace notebooks/03_modeling_and_model_selection.ipynb
 ```
-The command will execute all cells, compute all statistics, and save all visual plots directly into `EDA.ipynb`.
+All three notebooks execute to completion with return code 0, validating all assertions and embedding visual outputs directly into the `.ipynb` files.
