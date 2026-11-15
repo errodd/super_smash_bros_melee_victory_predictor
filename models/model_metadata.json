@@ -1,0 +1,42 @@
+{
+  "winner_model": "LogisticRegression (Optuna, class_weight=None)",
+  "feature_config": {
+    "feature_set": "base5_frame",
+    "include_symmetric_edgeguard": true,
+    "include_lexicographic_features": true
+  },
+  "best_params": {
+    "class_weight": "none",
+    "C": 0.00013212322129708785
+  },
+  "oof_optimal_threshold": 0.505,
+  "cv_protocol": "StratifiedGroupKFold(n_splits=5)",
+  "fit_time_seconds": 3.8165549029999966,
+  "test_metrics": {
+    "Conjunto": "Test (Dev 20%)",
+    "Partidas": 29,
+    "Frames": 299011,
+    "Model Acc": 0.5686680423128246,
+    "Heur Acc": 0.5689255579226182,
+    "Model F1": 0.5619946585585012,
+    "Heur F1": 0.5624546056319264,
+    "Model ROC AUC": 0.6284158023813796,
+    "Model Brier": 0.25673480760161566
+  },
+  "holdout_metrics": {
+    "Conjunto": "Holdout Intacto (00fd+00fe)",
+    "Partidas": 48,
+    "Frames": 516995,
+    "Model Acc": 0.7317150069149605,
+    "Heur Acc": 0.733312701283378,
+    "Model F1": 0.7282825767553838,
+    "Heur F1": 0.7297770607347354,
+    "Model ROC AUC": 0.8167458641769132,
+    "Model Brier": 0.1765325538183529
+  },
+  "versions": {
+    "python": "3.14.8",
+    "scikit_learn": "1.9.0",
+    "optuna": "5.0.0"
+  }
+}
