@@ -1,0 +1,19 @@
+{
+  "random_state": 42,
+  "test_size": 0.2,
+  "data_path": "data/processed_dev.parquet",
+  "n_rows_raw": 1577114,
+  "n_rows_clean": 1559260,
+  "n_matches_total": 144,
+  "n_matches_train": 115,
+  "n_matches_test": 29,
+  "output_dtype": "float64",
+  "n_features_full_pipeline": 83,
+  "versions": {
+    "python": "3.14.8",
+    "pandas": "3.0.5",
+    "numpy": "2.5.2",
+    "scikit_learn": "1.9.0",
+    "pyarrow": "25.0.1"
+  }
+}
