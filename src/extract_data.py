@@ -14,7 +14,7 @@ the corresponding match outcome label, and converts the data into a tabular form
 import os
 import argparse
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Sequence, Set
 from collections import defaultdict
 import zstandard as zstd
 import msgpack
@@ -59,18 +59,34 @@ def load_labels_subset(labels_csv_path: str, target_file_ids: Set[str]) -> Dict[
     return labels
 
 
+TRANSFORM_PAIRS: tuple[frozenset[str], ...] = (
+    frozenset({"SHEIK", "ZELDA"}),
+)
+
+
+def _canonical_character(character: Optional[str]) -> Optional[str]:
+    """Maps mid-match transformation forms (e.g. Sheik/Zelda) to a single key."""
+    if character is None:
+        return None
+    for pair in TRANSFORM_PAIRS:
+        if character in pair:
+            return "/".join(sorted(pair))
+    return character
+
+
 def assign_match_ids(frames_list: list, file_id: str) -> Dict[int, str]:
     """
     Reconstructs distinct matches from a shuffled list of frames.
-    
-    Frames are grouped by stage, player costumes, and characters, then sorted
-    chronologically by frame index. Any sequence where consecutive frames increment
-    by 1 belongs to the exact same match.
-    
+
+    Frames are grouped by stage, player costumes, and canonicalized characters
+    (so mid-match transformations such as Sheik <-> Zelda stay unified), then
+    sorted chronologically by frame index. Any sequence where consecutive frames
+    increment by 1 belongs to the exact same match.
+
     Args:
         frames_list: Unpacked list of frame dictionaries from a single archive.
         file_id: The partition identifier (e.g. "0000").
-        
+
     Returns:
         Dictionary mapping original frame index in the archive -> match_id.
     """
@@ -82,8 +98,8 @@ def assign_match_ids(frames_list: list, file_id: str) -> Dict[int, str]:
             fr.get("stage"),
             p1.get("costume"),
             p2.get("costume"),
-            p1.get("character"),
-            p2.get("character")
+            _canonical_character(p1.get("character")),
+            _canonical_character(p2.get("character")),
         )
         groups[key].append((fr.get("frame"), idx))
 
@@ -277,13 +293,100 @@ def process_dataset(
     return combined_df
 
 
+def canonicalize_match_ids(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Deterministic post-extraction canonicalization of fragmented match_ids.
+
+    Detects contiguous frame segments (end_frame + 1 == start_frame) within the
+    same source file, stage, and costumes where player characters match or belong
+    to a valid transformation pair (e.g., SHEIK <-> ZELDA), and assigns the
+    earliest segment's match_id as the canonical key.
+    """
+    if df.empty or "match_id" not in df.columns:
+        return df
+
+    out = df.copy()
+    if "file_id" in out.columns:
+        file_series = out["file_id"].astype(str)
+    else:
+        file_series = out["match_id"].astype(str).str.split("_").str[0]
+
+    seg = (
+        out.assign(_file_id=file_series)
+        .groupby("match_id", sort=False)
+        .agg(
+            _file_id=("_file_id", "first"),
+            stage=("stage", "first"),
+            p1_costume=("p1_costume", "first"),
+            p2_costume=("p2_costume", "first"),
+            p1_char=("p1_character", "first"),
+            p2_char=("p2_character", "first"),
+            frame_min=("frame", "min"),
+            frame_max=("frame", "max"),
+        )
+        .reset_index()
+    )
+    seg["_p1_canon"] = seg["p1_char"].map(_canonical_character)
+    seg["_p2_canon"] = seg["p2_char"].map(_canonical_character)
+    seg = seg.sort_values(
+        ["_file_id", "stage", "p1_costume", "p2_costume", "_p1_canon", "_p2_canon", "frame_min"]
+    ).reset_index(drop=True)
+
+    remap: Dict[str, str] = {}
+    group_cols = ["_file_id", "stage", "p1_costume", "p2_costume", "_p1_canon", "_p2_canon"]
+    for _, grp in seg.groupby(group_cols, sort=False):
+        rows = grp.to_dict("records")
+        canon_id = rows[0]["match_id"]
+        prev_max = rows[0]["frame_max"]
+        remap[rows[0]["match_id"]] = canon_id
+        for r in rows[1:]:
+            if r["frame_min"] == prev_max + 1:
+                remap[r["match_id"]] = canon_id
+            else:
+                canon_id = r["match_id"]
+                remap[r["match_id"]] = canon_id
+            prev_max = r["frame_max"]
+
+    out["match_id"] = out["match_id"].map(lambda m: remap.get(m, m))
+    return out
+
+
+def resolve_partition_files(
+    partitions: Sequence[str],
+    archive_dir: str = "data/archive/train",
+) -> List[str]:
+    """Resolves partition prefixes (e.g. ['0000', '0001']) to .msgpack.zst paths."""
+    base = Path(archive_dir)
+    paths: List[str] = []
+    for part in partitions:
+        p = base / f"{part}.msgpack.zst"
+        if not p.exists():
+            raise FileNotFoundError(
+                f"Partition archive not found: {p}. Run 'dvc pull' to fetch missing archives."
+            )
+        paths.append(str(p))
+    return paths
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Decompress, unpack, and flatten SSBM match data.")
     parser.add_argument(
         "--input_files",
         nargs="+",
-        default=["data/archive/train/0000.msgpack.zst"],
+        default=None,
         help="List of .msgpack.zst files to process."
+    )
+    parser.add_argument(
+        "--partitions",
+        nargs="+",
+        default=None,
+        help="Partition prefixes (e.g. 0000 0001) resolved inside --archive_dir."
+    )
+    parser.add_argument(
+        "--archive_dir",
+        type=str,
+        default="data/archive/train",
+        help="Directory containing .msgpack.zst partition archives."
     )
     parser.add_argument(
         "--labels_csv",
@@ -305,8 +408,15 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+    if args.partitions:
+        input_files = resolve_partition_files(args.partitions, args.archive_dir)
+    elif args.input_files:
+        input_files = args.input_files
+    else:
+        input_files = ["data/archive/train/0000.msgpack.zst"]
+
     process_dataset(
-        file_paths=args.input_files,
+        file_paths=input_files,
         labels_csv_path=args.labels_csv,
         output_path=args.output_path,
         max_frames_per_file=args.max_frames
